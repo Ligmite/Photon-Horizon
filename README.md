@@ -127,8 +127,7 @@ HDR additions under the HDR fork's terms.
 Photon is distributed under the **Photon Shaders License Agreement** (© 2021–2025 Benjamin Stott).
 It allows use, personal modification, study and redistribution, with two restrictions: it may not
 be redistributed on platforms that pay creators directly or indirectly (Modrinth, CurseForge, …)
-without the author's written permission, and it may not be sold. The licence text must ship with
-substantial copies of the pack.
+without the author's written permission, and it may not be sold.
 
 The full text is in [LICENSE](LICENSE). ACES components carry their own licence in
 [licenses/LICENSE-ACES.md](licenses/LICENSE-ACES.md).
