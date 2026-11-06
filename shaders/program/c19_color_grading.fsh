@@ -1,0 +1,221 @@
+/*
+--------------------------------------------------------------------------------
+
+  Photon Shader by SixthSurge
+
+  program/c19_color_grading:
+  Apply bloom, color grading and tone mapping then convert to rec. 709
+
+--------------------------------------------------------------------------------
+*/
+
+#include "/include/global.glsl"
+
+layout(location = 0) out vec3 scene_color;
+
+/* RENDERTARGETS: 0 */
+
+in vec2 uv;
+
+#if GRADE_WHITE_BALANCE != 6500
+flat in mat3 white_balance_matrix;
+#endif
+
+// ------------
+//   Uniforms
+// ------------
+
+uniform sampler2D colortex0; // bloom tiles
+uniform sampler2D colortex3; // fog transmittance
+uniform sampler2D colortex5; // scene color
+
+uniform float aspectRatio;
+uniform float blindness;
+uniform float darknessFactor;
+uniform float frameTimeCounter;
+
+uniform float biome_cave;
+uniform float time_noon;
+uniform float eye_skylight;
+
+uniform vec2 view_pixel_size;
+
+#if defined HDR_MOD_INSTALLED && defined HDR_ENABLED
+uniform float HdrGamePeakBrightness;
+uniform float HdrGamePaperWhiteBrightness;
+uniform float HdrGameMinimumBrightness;
+uniform float HdrUIBrightness;
+#endif
+
+#include "/include/post_processing/tonemap_operators.glsl"
+#include "/include/utility/bicubic.glsl"
+#include "/include/utility/color.glsl"
+
+// Invertible tonemapping operator (Reinhard)
+vec3 reinhard(vec3 rgb) { return rgb / (rgb + 1.0); }
+
+vec3 reinhard_inverse(vec3 rgb) { return rgb / (1.0 - rgb); }
+
+vec3 get_bloom() {
+    // Upsample last bloom tile.
+
+    vec2 pad_amount = 6.0 * view_pixel_size;
+    vec2 uv_src = clamp(uv, pad_amount, 1.0 - pad_amount) * 0.5;
+
+    return BLOOM_UPSAMPLING_FILTER(colortex0, uv_src).rgb;
+}
+
+// Color grading
+
+vec3 gain(vec3 x, float k) {
+    vec3 a = 0.5 * pow(2.0 * mix(x, 1.0 - x, step(0.5, x)), vec3(k));
+    return mix(a, 1.0 - a, step(0.5, x));
+}
+
+// Color grading applied before tone mapping
+// rgb := color in acescg [0, inf]
+vec3 grade_input(vec3 rgb) {
+    float brightness = 0.83 * GRADE_BRIGHTNESS;
+    float contrast = 1.00 * GRADE_CONTRAST;
+    float saturation = 0.98 * GRADE_SATURATION;
+
+    // Brightness
+    rgb *= brightness;
+
+    // Contrast
+    const float log_midpoint = log2(0.18);
+    rgb = log2(rgb + eps);
+    rgb = contrast * (rgb - log_midpoint) + log_midpoint;
+    rgb = max0(exp2(rgb) - eps);
+
+    // Saturation
+    float lum = dot(rgb, luminance_weights);
+    rgb = max0(mix(vec3(lum), rgb, saturation));
+
+    // White balance
+#if GRADE_WHITE_BALANCE != 6500
+    rgb = rgb * rec2020_to_xyz;
+    rgb = rgb * white_balance_matrix;
+    rgb = rgb * xyz_to_rec2020;
+#endif
+
+    rgb = max0(rgb);
+
+    return rgb;
+}
+
+// Color grading applied after tone mapping
+// rgb := color in linear rec.709 [0, 1]
+vec3 grade_output(vec3 rgb) {
+    // Convert to roughly perceptual RGB for color grading
+    rgb = sqrt(rgb);
+
+    // HSL color grading inspired by Tech's color grading setup in Lux Shaders
+
+    const float orange_sat_boost = GRADE_ORANGE_SAT_BOOST;
+    const float teal_sat_boost = GRADE_TEAL_SAT_BOOST;
+    const float green_sat_boost = GRADE_GREEN_SAT_BOOST;
+    const float green_hue_shift = GRADE_GREEN_HUE_SHIFT / 360.0;
+
+    vec3 hsl = rgb_to_hsl(rgb);
+
+    // Oranges
+    float orange = isolate_hue(hsl, 30.0, 20.0);
+    hsl.y *= 1.0 + orange_sat_boost * orange;
+
+    // Teals
+    float teal = isolate_hue(hsl, 210.0, 20.0);
+    hsl.y *= 1.0 + teal_sat_boost * teal;
+
+    // Greens
+    float green = isolate_hue(hsl, 90.0, 44.0);
+    hsl.x += green_hue_shift * green;
+    hsl.y *= 1.0 + green_sat_boost * green;
+
+    rgb = hsl_to_rgb(hsl);
+
+    rgb = gain(rgb, 1.05);
+
+    rgb = sqr(rgb);
+
+    return rgb;
+}
+
+float vignette(vec2 uv) {
+    const float vignette_size = 16.0;
+    const float vignette_intensity = 0.08 * VIGNETTE_INTENSITY;
+
+    float darkness_pulse = 1.0 - dampen(abs(cos(2.0 * frameTimeCounter)));
+
+    float vignette
+        = vignette_size * (uv.x * uv.y - uv.x) * (uv.x * uv.y - uv.y);
+    vignette = pow(
+        vignette,
+        vignette_intensity + 0.1 * biome_cave + 0.3 * blindness
+            + 0.2 * darkness_pulse * darknessFactor
+    );
+
+    return vignette;
+}
+
+void main() {
+    ivec2 texel = ivec2(gl_FragCoord.xy);
+
+    scene_color = texelFetch(colortex5, texel, 0).rgb;
+
+    float exposure = texelFetch(colortex5, ivec2(0), 0).a;
+
+#ifdef BLOOM
+    vec3 bloom = get_bloom();
+    float bloom_intensity = 0.12 * BLOOM_INTENSITY;
+
+    scene_color = mix(scene_color, bloom, bloom_intensity);
+
+#ifdef BLOOMY_FOG
+    float fog_transmittance = texture(colortex3, uv * taau_render_scale).x;
+    scene_color
+        = mix(bloom, scene_color, pow(fog_transmittance, BLOOMY_FOG_INTENSITY));
+#endif
+#endif
+
+    scene_color *= exposure;
+
+#ifdef VIGNETTE
+    scene_color *= vignette(uv);
+#endif
+
+    scene_color = grade_input(scene_color);
+
+#ifdef TONEMAP_COMPARISON
+    scene_color
+        = uv.x < 0.5 ? tonemap_left(scene_color) : tonemap_right(scene_color);
+#else
+#ifdef HDR_ENABLED
+    scene_color = hdr_tonemap(scene_color);
+#else
+    scene_color = tonemap(scene_color);
+#endif
+#endif
+#ifdef HDR_ENABLED
+    // TODO: not ideal ramming HDR color into LDR color grade, but it works now
+    scene_color = reinhard(scene_color);
+    scene_color = grade_output(scene_color);
+    scene_color = reinhard_inverse(scene_color);
+    // Unlike SDR path, maintain clamped rec2020 for the subsequent colorspace agnostic passes until final to prevent negative values in FXAA and other passes from breaking assumptions, then convert to display space at the end.
+    scene_color = max(scene_color, vec3(0));
+#else
+    scene_color = clamp01(scene_color * working_to_display_color);
+    scene_color = grade_output(scene_color);
+#endif
+
+#if 0 // Tonemap plot
+	const float scale = 2.0;
+	vec2 uv_scaled = uv * scale * vec2(1.0, 1.0 / aspectRatio);
+	float x = uv_scaled.x;
+	float y = tonemap(vec3(x)).x;
+
+	if (abs(uv_scaled.x - 1.0) < 0.001 * scale) scene_color = vec3(1.0, 0.0, 0.0);
+	if (abs(uv_scaled.y - 1.0) < 0.001 * scale) scene_color = vec3(1.0, 0.0, 0.0);
+	if (abs(uv_scaled.y - y) < 0.001 * scale) scene_color = vec3(1.0);
+#endif
+}
