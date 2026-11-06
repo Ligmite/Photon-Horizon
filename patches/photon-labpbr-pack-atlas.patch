@@ -1,0 +1,280 @@
+diff --git a/crates/horizon-client-render/src/gfx/pack_atlas.rs b/crates/horizon-client-render/src/gfx/pack_atlas.rs
+--- a/crates/horizon-client-render/src/gfx/pack_atlas.rs
++++ b/crates/horizon-client-render/src/gfx/pack_atlas.rs
+@@ -12,6 +12,12 @@
+     pub sprite: u32,
+     /// Layers per sprite array.
+     split: u32,
++    /// The sprite layers and rows the grid holds, for `with_labpbr`.
++    layers: u32,
++    rows: u32,
++    /// The LabPBR normal and specular atlases over the same grid, when the resource packs'
++    /// maps match the atlas's sprite size (`with_labpbr`).
++    labpbr: Option<[wgpu::TextureView; 2]>,
+     /// OptiFine/Iris separate ambient occlusion: pass vertex alpha to hz_Color.a.
+     pub separate_ao: bool,
+ }
+@@ -59,10 +65,102 @@
+             columns,
+             sprite,
+             split,
++            layers,
++            rows,
++            labpbr: None,
+             separate_ao: false,
+         };
+         atlas.copy(encoder, arrays, 0..layers);
+         Some(atlas)
++    }
++
++    /// The LabPBR normal and specular atlases (resource packs' `_n`/`_s` maps) over this
++    /// atlas's grid, so a pack's `normals` and `specular` samplers see the same cells as its
++    /// block atlas. Keeps the stand-ins when the maps are not the atlas's sprite size (a layer
++    /// would not fit a cell) or the grid is larger than the device allows.
++    pub fn with_labpbr(
++        mut self,
++        device: &wgpu::Device,
++        encoder: &mut wgpu::CommandEncoder,
++        maps: &[wgpu::Texture; 2],
++    ) -> Self {
++        let sprite = self.sprite;
++        if maps
++            .iter()
++            .any(|m| m.width() != sprite || m.height() != sprite)
++        {
++            return self;
++        }
++        let levels = (self.texture.mip_level_count().min(sprite.ilog2() + 1))
++            .min(maps[0].mip_level_count())
++            .min(maps[1].mip_level_count());
++        let max = device.limits().max_texture_dimension_2d;
++        if self.columns * sprite > max || self.rows * sprite > max {
++            return self;
++        }
++        let mut views: [Option<wgpu::TextureView>; 2] = [None, None];
++        for (k, map) in maps.iter().enumerate() {
++            let texture = device.create_texture(&wgpu::TextureDescriptor {
++                label: Some("Shader pack LabPBR atlas"),
++                size: wgpu::Extent3d {
++                    width: self.columns * sprite,
++                    height: self.rows * sprite,
++                    depth_or_array_layers: 1,
++                },
++                mip_level_count: levels,
++                sample_count: 1,
++                dimension: wgpu::TextureDimension::D2,
++                format: wgpu::TextureFormat::Rgba8Unorm,
++                usage: wgpu::TextureUsages::TEXTURE_BINDING
++                    | wgpu::TextureUsages::COPY_DST
++                    | wgpu::TextureUsages::COPY_SRC,
++                view_formats: &[],
++            });
++            for layer in 0..self.layers {
++                let (column, row) = (layer % self.columns, layer / self.columns);
++                for level in 0..levels {
++                    let edge = (sprite >> level).max(1);
++                    encoder.copy_texture_to_texture(
++                        wgpu::TexelCopyTextureInfo {
++                            texture: map,
++                            mip_level: level,
++                            origin: wgpu::Origin3d {
++                                x: 0,
++                                y: 0,
++                                z: layer,
++                            },
++                            aspect: wgpu::TextureAspect::All,
++                        },
++                        wgpu::TexelCopyTextureInfo {
++                            texture: &texture,
++                            mip_level: level,
++                            origin: wgpu::Origin3d {
++                                x: column * edge,
++                                y: row * edge,
++                                z: 0,
++                            },
++                            aspect: wgpu::TextureAspect::All,
++                        },
++                        wgpu::Extent3d {
++                            width: edge,
++                            height: edge,
++                            depth_or_array_layers: 1,
++                        },
++                    );
++                }
++            }
++            views[k] = Some(texture.create_view(&Default::default()));
++        }
++        self.labpbr = match views {
++            [Some(normals), Some(specular)] => Some([normals, specular]),
++            _ => None,
++        };
++        self
++    }
++
++    /// The LabPBR normal and specular atlases (`with_labpbr`), when the maps were usable.
++    pub fn labpbr(&self) -> Option<[wgpu::TextureView; 2]> {
++        self.labpbr.clone()
+     }
+ 
+     /// The atlas's size in pixels (`atlasSize`).
+diff --git a/crates/horizon-client-render/src/gfx/pack_post.rs b/crates/horizon-client-render/src/gfx/pack_post.rs
+--- a/crates/horizon-client-render/src/gfx/pack_post.rs
++++ b/crates/horizon-client-render/src/gfx/pack_post.rs
+@@ -96,15 +96,7 @@
+ impl SamplerKind {
+     fn of(source: Source, filtering: bool) -> Self {
+         match source {
+-            Source::Color(_)
+-            | Source::ShadowColor(_)
+-            | Source::Dummy
+-            | Source::Normals
+-            | Source::Specular
+-                if !filtering =>
+-            {
+-                Self::Nearest
+-            }
++            Source::Color(_) | Source::ShadowColor(_) | Source::Dummy if !filtering => Self::Nearest,
+             Source::Depth | Source::Depth1 | Source::Depth2 | Source::ShadowDepth(_, false) => {
+                 Self::Nearest
+             }
+@@ -437,6 +429,9 @@
+ pub(super) struct World<'a> {
+     /// The block atlas and its size.
+     pub atlas: Option<(wgpu::TextureView, [u32; 2])>,
++    /// The LabPBR normal and specular atlases over the block atlas's grid (pack_atlas.rs),
++    /// when the resource packs ship maps of the atlas's sprite size.
++    pub labpbr: Option<[wgpu::TextureView; 2]>,
+     pub lightmap: wgpu::TextureView,
+     /// Terrain's geometry, when the pack draws it.
+     pub terrain: Option<Geometry<'a>>,
+@@ -573,6 +568,9 @@
+     /// `shaders.properties`' custom uniforms, after the frame's in `uniforms.values`.
+     custom: horizon_shaders::Custom,
+     atlas: Option<wgpu::TextureView>,
++    /// The LabPBR normal and specular atlases the pack's `normals`/`specular` samplers read
++    /// (pack_atlas.rs), when the resource packs ship maps of the atlas's sprite size.
++    labpbr: Option<[wgpu::TextureView; 2]>,
+     lightmap: wgpu::TextureView,
+     deferred_pre: u16,
+     composite_pre: u16,
+@@ -2513,6 +2511,7 @@
+             center_depth: None,
+             custom,
+             atlas: world.atlas.as_ref().map(|a| a.0.clone()),
++            labpbr: world.labpbr.clone(),
+             lightmap: world.lightmap,
+             deferred_pre: mask(&post.deferred_pre),
+             composite_pre: mask(&post.composite_pre),
+@@ -2792,8 +2791,14 @@
+                     Source::Dummy if s.dimension == wgpu::TextureViewDimension::D1 => {
+                         &self.dummy_1d
+                     }
+-                    Source::Normals => &self.dummy_normal,
+-                    Source::Specular => &self.dummy_black,
++                    Source::Normals => self
++                        .labpbr
++                        .as_ref()
++                        .map_or(&self.dummy_normal, |atlas| &atlas[0]),
++                    Source::Specular => self
++                        .labpbr
++                        .as_ref()
++                        .map_or(&self.dummy_black, |atlas| &atlas[1]),
+                     Source::Dummy => &self.dummy,
+                     Source::Image(k) if pass.image_copies & 1 << k != 0 => {
+                         self.images[k].copy.as_ref().unwrap_or(&self.dummy)
+diff --git a/crates/horizon-client-render/src/gfx/pack_post/depth_test.rs b/crates/horizon-client-render/src/gfx/pack_post/depth_test.rs
+--- a/crates/horizon-client-render/src/gfx/pack_post/depth_test.rs
++++ b/crates/horizon-client-render/src/gfx/pack_post/depth_test.rs
+@@ -322,6 +322,7 @@
+         shaders(sampler, stage, scene),
+         World {
+             atlas: None,
++            labpbr: None,
+             lightmap: color.clone(),
+             terrain: terrain.then_some(Geometry {
+                 buffers: &layouts,
+diff --git a/crates/horizon-client-render/src/gfx/pack_post/destination_tests.rs b/crates/horizon-client-render/src/gfx/pack_post/destination_tests.rs
+--- a/crates/horizon-client-render/src/gfx/pack_post/destination_tests.rs
++++ b/crates/horizon-client-render/src/gfx/pack_post/destination_tests.rs
+@@ -208,6 +208,7 @@
+             T::Rgba8Unorm,
+             World {
+                 atlas: None,
++                labpbr: None,
+                 lightmap,
+                 terrain: None,
+                 block_ids: &[],
+diff --git a/crates/horizon-client-render/src/gfx/pack_post/world_target_tests.rs b/crates/horizon-client-render/src/gfx/pack_post/world_target_tests.rs
+--- a/crates/horizon-client-render/src/gfx/pack_post/world_target_tests.rs
++++ b/crates/horizon-client-render/src/gfx/pack_post/world_target_tests.rs
+@@ -215,6 +215,7 @@
+         T::Rgba8Unorm,
+         World {
+             atlas: None,
++            labpbr: None,
+             lightmap: lightmap.clone(),
+             terrain: None,
+             block_ids: &[],
+diff --git a/crates/horizon-client-render/src/gfx.rs b/crates/horizon-client-render/src/gfx.rs
+--- a/crates/horizon-client-render/src/gfx.rs
++++ b/crates/horizon-client-render/src/gfx.rs
+@@ -5993,6 +5993,7 @@
+         let post = pack.map(|post| {
+             let world = pack_post::World {
+                 atlas: self.pack_atlas.as_ref().map(|a| (a.view.clone(), a.size())),
++                labpbr: self.pack_atlas.as_ref().and_then(|a| a.labpbr()),
+                 lightmap: self.lightmap_view.clone(),
+                 gui_size: self
+                     .hud
+@@ -6142,7 +6143,13 @@
+                 self.sprite_split,
+                 layers,
+                 self.sprite_textures[0].width(),
+-            );
++            )
++            .map(|atlas| match self.pbr_maps.as_ref() {
++                // LabPBR in the pack path: the resource packs' maps in the atlas's grid, so
++                // the pack's `normals`/`specular` samplers line up with its block atlas.
++                Some(maps) => atlas.with_labpbr(&self.device, &mut encoder, maps),
++                None => atlas,
++            });
+             if let Some(atlas) = &mut atlas {
+                 atlas.separate_ao = self.separate_ao;
+             }
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -20016,7 +20016,7 @@
+     // server thread's (horizon_threads::jobs), sized before any world opens.
+     horizon_threads::jobs::configure(threads);
+     horizon_client::sprites::set_texture_budget(settings.horizon.texture_budget_mib);
+-    horizon_client::sprites::set_labpbr_maps(shader_packs::picks_native_pack(settings));
++    horizon_client::sprites::set_labpbr_maps(shader_packs::picks_pack(settings));
+     // Stage A: the menu bundle (atlas and panorama). With a loading screen it is
+     // published at once so the title screen can appear while the world bundle
+     // loads; the synchronous launch instead carries it in `Loaded`.
+diff --git a/crates/horizon-client/src/game/shader_packs.rs b/crates/horizon-client/src/game/shader_packs.rs
+--- a/crates/horizon-client/src/game/shader_packs.rs
++++ b/crates/horizon-client/src/game/shader_packs.rs
+@@ -108,16 +108,17 @@
+     }
+ }
+ 
+-/// Whether the pack `settings` pick (or `HORIZON_SHADER_PACK`) is one of Horizon's own: only
+-/// then do resource loads read the resource packs' LabPBR maps (`sprites::set_labpbr_maps`).
+-pub(super) fn picks_native_pack(settings: &horizon_client::settings::Settings) -> bool {
++/// Whether a pack `settings` pick (or `HORIZON_SHADER_PACK`) is on, of either kind: `shaders/`
++/// packs read the resource packs' LabPBR maps through their `normals`/`specular` samplers, as
++/// Horizon's own packs read them through their material stage. Only then do resource loads read
++/// the maps (`sprites::set_labpbr_maps`).
++pub(super) fn picks_pack(settings: &horizon_client::settings::Settings) -> bool {
+     let dev = std::env::var("HORIZON_SHADER_PACK").ok();
+     let picked = active_pack(
+         dev.as_deref().unwrap_or(&settings.horizon.shader_pack),
+         &settings.mods,
+     );
+     !picked.is_empty()
+-        && horizon_shader_api::package::is_pack(&Game::shader_packs_dir().join(picked))
+ }
+ 
+ /// The ids a pack gives entities and block entities (4.1, 5.3), for the spans of the entity
