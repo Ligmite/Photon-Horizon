@@ -1,7 +1,5 @@
 # Photon for Horizon
 
-**One-line summary:** Photon, the gameplay-focused Minecraft shader pack, ported to run on Horizon's shader-pack loader.
-
 Photon for Horizon brings [SixthSurge's Photon](https://github.com/sixthsurge/photon) to
 [Horizon](https://github.com/horizon-rust/horizon), the Minecraft: Java Edition rewrite in Rust. It
 runs Photon's deferred rendering pipeline on Horizon's OptiFine/Iris-format shader-pack runtime
