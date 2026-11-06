@@ -1,0 +1,13 @@
+# Build output: build-pack.* writes Photon-Horizon.zip. Publish packs as release
+# assets instead of committing them.
+*.zip
+
+# Python caches for tools/
+__pycache__/
+*.py[cod]
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
