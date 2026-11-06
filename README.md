@@ -95,8 +95,7 @@ build-pack.ps1/.sh        build Photon-Horizon.zip
 
 ## Credits
 
-**Photon** — © 2021–2025 **Benjamin Stott ("SixthSurge")**, author of Photon Shaders. Photon's
-own acknowledgements, kept here because this port ships their work:
+**Photon** — © 2021–2025 **Benjamin Stott ("SixthSurge")**, author of Photon Shaders. 
 
 - Menu translations: NakiriRuri and OrzMiku (Chinese Simplified), ChunghwaMC (Chinese Traditional),
   Jmayk (Italian), Timtaran (Russian), shihyeon (Korean), DVRKHz (Spanish), Patatagod69 (Dutch),
